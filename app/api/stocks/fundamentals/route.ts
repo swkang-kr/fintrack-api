@@ -8,8 +8,36 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { fetchKisDomesticFundamentals } from '@/lib/stocks/kis';
 
-const YF_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// ── Yahoo Finance crumb 캐시 (함수 인스턴스 수준) ─────────
+let yfCrumbCache: { crumb: string; cookie: string; expiry: number } | null = null;
+
+async function getYFCrumb(): Promise<{ crumb: string; cookie: string }> {
+  if (yfCrumbCache && Date.now() < yfCrumbCache.expiry) {
+    return yfCrumbCache;
+  }
+
+  // Step 1: Yahoo Finance 방문으로 쿠키 획득
+  const pageRes = await fetch('https://finance.yahoo.com/', {
+    headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
+    redirect: 'follow',
+  });
+  const rawCookie = pageRes.headers.get('set-cookie') ?? '';
+  const cookie = rawCookie.split(/,(?=\s*\w+=)/).map((c) => c.split(';')[0].trim()).join('; ');
+
+  // Step 2: crumb 발급
+  const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
+    headers: { 'User-Agent': UA, Cookie: cookie },
+  });
+  const crumb = (await crumbRes.text()).trim();
+
+  yfCrumbCache = { crumb, cookie, expiry: Date.now() + 25 * 60 * 1000 };
+  return yfCrumbCache;
+}
+
+const YF_CHART_HEADERS = {
+  'User-Agent': UA,
   Accept: 'application/json',
 };
 
@@ -89,40 +117,74 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // ── Yahoo Finance (해외 또는 KIS fallback) ────────────────
+  // ── Yahoo Finance (crumb 인증 → quoteSummary, chart fallback) ──
   try {
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}&fields=trailingPE,forwardPE,epsTrailingTwelveMonths,fiftyTwoWeekHigh,fiftyTwoWeekLow,marketCap,dividendYield,beta,targetMeanPrice,targetHighPrice,targetLowPrice,numberOfAnalystOpinions,recommendationKey`;
+    // chart 엔드포인트로 52주 고저 / 거래량 등 기본 데이터 획득 (crumb 불필요)
+    const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`;
+    const chartRes = await fetch(chartUrl, { headers: YF_CHART_HEADERS, next: { revalidate: 300 } });
+    const chartMeta = chartRes.ok ? (await chartRes.json())?.chart?.result?.[0]?.meta ?? {} : {};
 
-    const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 3600 } });
-    if (!res.ok) throw new Error(`Yahoo Finance error: ${res.status}`);
+    // crumb 인증 후 quoteSummary로 PE/EPS/시가총액 등 획득
+    let ks: Record<string, { raw?: number } | number | string | null> = {};
+    let fd: Record<string, { raw?: number } | number | string | null> = {};
+    let sd: Record<string, { raw?: number } | number | string | null> = {};
 
-    const json = await res.json();
-    const q = json?.quoteResponse?.result?.[0];
-    if (!q) return NextResponse.json({ error: 'not found' }, { status: 404 });
+    try {
+      const { crumb, cookie } = await getYFCrumb();
+      const modules = 'defaultKeyStatistics,financialData,summaryDetail';
+      const qsUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules}&crumb=${encodeURIComponent(crumb)}`;
+      const qsRes = await fetch(qsUrl, {
+        headers: { 'User-Agent': UA, Accept: 'application/json', Cookie: cookie },
+        next: { revalidate: 3600 },
+      });
+      if (qsRes.ok) {
+        const qsJson = await qsRes.json();
+        const result = qsJson?.quoteSummary?.result?.[0];
+        if (result) {
+          ks = result.defaultKeyStatistics ?? {};
+          fd = result.financialData ?? {};
+          sd = result.summaryDetail ?? {};
+        }
+      }
+    } catch {
+      // quoteSummary 실패 시 chart 데이터만 사용
+    }
+
+    const raw = (obj: Record<string, { raw?: number } | number | string | null>, key: string): number | null => {
+      const val = obj[key];
+      if (val == null) return null;
+      if (typeof val === 'object' && val !== null && 'raw' in val) return val.raw ?? null;
+      if (typeof val === 'number') return val;
+      return null;
+    };
+
+    if (!chartRes.ok && Object.keys(ks).length === 0) {
+      return NextResponse.json({ error: 'not found' }, { status: 404 });
+    }
 
     const fundamentals: StockFundamentals = {
       ticker,
       source: 'yahoo',
-      trailingPE:         q.trailingPE            ?? null,
-      forwardPE:          q.forwardPE             ?? null,
-      epsTrailing:        q.epsTrailingTwelveMonths ?? null,
-      fiftyTwoWeekHigh:   q.fiftyTwoWeekHigh      ?? null,
-      fiftyTwoWeekLow:    q.fiftyTwoWeekLow       ?? null,
-      marketCap:          q.marketCap             ?? null,
-      dividendYield:      q.dividendYield != null ? q.dividendYield * 100 : null,
-      beta:               q.beta                  ?? null,
+      trailingPE:         raw(ks, 'trailingPE'),
+      forwardPE:          raw(ks, 'forwardPE'),
+      epsTrailing:        raw(ks, 'trailingEps'),
+      fiftyTwoWeekHigh:   raw(sd, 'fiftyTwoWeekHigh') ?? chartMeta.fiftyTwoWeekHigh ?? null,
+      fiftyTwoWeekLow:    raw(sd, 'fiftyTwoWeekLow')  ?? chartMeta.fiftyTwoWeekLow  ?? null,
+      marketCap:          raw(sd, 'marketCap'),
+      dividendYield:      raw(sd, 'dividendYield') != null ? (raw(sd, 'dividendYield')! * 100) : null,
+      beta:               raw(ks, 'beta'),
       pbr:                null,
       bps:                null,
       foreignHoldingRate: null,
-      todayOpen:          null,
-      todayHigh:          null,
-      todayLow:           null,
-      volume:             null,
-      targetMeanPrice:    q.targetMeanPrice        ?? null,
-      targetHighPrice:    q.targetHighPrice        ?? null,
-      targetLowPrice:     q.targetLowPrice         ?? null,
-      analystCount:       q.numberOfAnalystOpinions ?? null,
-      recommendationKey:  q.recommendationKey      ?? null,
+      todayOpen:          chartMeta.regularMarketOpen   ?? null,
+      todayHigh:          chartMeta.regularMarketDayHigh ?? null,
+      todayLow:           chartMeta.regularMarketDayLow  ?? null,
+      volume:             chartMeta.regularMarketVolume  ?? null,
+      targetMeanPrice:    raw(fd, 'targetMeanPrice'),
+      targetHighPrice:    raw(fd, 'targetHighPrice'),
+      targetLowPrice:     raw(fd, 'targetLowPrice'),
+      analystCount:       raw(fd, 'numberOfAnalystOpinions'),
+      recommendationKey:  typeof fd.recommendationKey === 'string' ? fd.recommendationKey : null,
     };
 
     return NextResponse.json(
